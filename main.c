@@ -6,10 +6,15 @@
 #define PLAYER_RADIUS 5
 #define CREATURE_SPEED 40
 
+#define SQUID_AMOUNT 10
+
 #define GRID_SIZE 16
 #define CELL_SIZE 20
 #define HALF_SIZE (CELL_SIZE/2)
 #define DEFAULT_HEIGHT (CELL_SIZE*0.5f)
+#define DAMAGE_TIME 0.1f
+
+#define FIRE_START_OFFSET (HALF_SIZE)
 
 #define ANIMATION_RATE (0.1f)
 
@@ -37,21 +42,28 @@ typedef enum PlaneType {
 } PlaneType;
 
 #define ANIMATION_AMOUNT 5
-typedef enum CreatureState { CREATURE_ALIVE, CREATURE_DEAD } CreatureState;
+typedef enum CreatureState {
+    CREATURE_ALIVE,
+    CREATURE_DAMAGED,
+    CREATURE_DEAD,
+} CreatureState;
 typedef struct Creature {
+    Matrix transform;
     CreatureState state;
+    float hit_radius;
+    int health;
     Plane plane;
     Cell cell;
     Vector3 position;
     Vector3 target;
     int direction;
+    float angle;
     int animation_index;
     Texture textures[ANIMATION_AMOUNT];
     Texture death_textures[ANIMATION_AMOUNT];
     float animation_timer;
+    float damage_timer;
 } Creature;
-
-// static bool cell_equals(Cell a, Cell b) { return a.x == b.x && a.z == b.z; }
 
 float random_float(float min, float max) {
     return min + (float)GetRandomValue(0, 10000) / 10000.0f * (max - min);
@@ -71,7 +83,6 @@ static Cell world_position_to_cell_position(Vector3 position) {
     result.z = position.z / CELL_SIZE;
     return result;
 }
-
 
 // TODO: not hardcoded map size
 bool is_wall(const char map[16][16], int x, int y) {
@@ -112,13 +123,20 @@ void update_creature_direction(const char map[16][16], Creature *creature) {
     creature->direction = new_direction;
 }
 
-void update_creature(const char map[16][16], Creature *creature) {
-    float dt = GetFrameTime();
+void update_creature_animation(Creature *creature) {
+    creature->animation_timer += GetFrameTime();
+    if (creature->animation_timer > ANIMATION_RATE) {
+        creature->animation_timer -= ANIMATION_RATE;
+        creature->animation_index = (creature->animation_index + 1) % ANIMATION_AMOUNT;
+        creature->plane.model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = creature->textures[creature->animation_index];
+    }
+}
 
+void update_creature_movement(const char map[16][16], Creature *creature) {
     Vector3 delta = Vector3Subtract(creature->target, creature->position);
     float distSqr = Vector3LengthSqr(delta);
 
-    if (distSqr < 0.01f * 0.01f)
+    if (distSqr < (0.01f * 0.01f))
     {
         creature->position = creature->target;
 
@@ -160,44 +178,79 @@ void update_creature(const char map[16][16], Creature *creature) {
     {
         Vector3 move_dir = Vector3Normalize(delta);
 
-        float step = CREATURE_SPEED * dt;
+        float step = CREATURE_SPEED * GetFrameTime();
 
         // CLAMP STEP so we never overshoot target
-        if (step * step > distSqr)
-        {
+        if (step * step > distSqr) {
             creature->position = creature->target;
-        }
-        else
-        {
+        } else {
             creature->position = Vector3Add(
                 creature->position,
                 Vector3Scale(move_dir, step)
             );
         }
     }
-
-    creature->animation_timer += dt;
-
-    if (creature->animation_timer > ANIMATION_RATE)
-    {
-        creature->animation_timer -= ANIMATION_RATE;
-        creature->animation_index = (creature->animation_index + 1) % ANIMATION_AMOUNT;
-
-        creature->plane.model.materials[0]
-            .maps[MATERIAL_MAP_DIFFUSE]
-            .texture = creature->textures[creature->animation_index];
-    }
 }
 
-void render_creature(Creature *creature, Vector3 player) {
-    Vector3 dir = { player.x - creature->position.x, 0.0f, player.z - creature->position.z };
-    float angle = atan2f(dir.x, dir.z) * RAD2DEG;
+void update_creature(const char map[16][16], Creature *creature, Vector3 player) {
+    float dt = GetFrameTime();
+
+    switch (creature->state) {
+        case CREATURE_ALIVE:
+        {
+            update_creature_movement(map, creature);
+            update_creature_animation(creature);
+            break;
+        }
+        case CREATURE_DAMAGED:
+        {
+            creature->damage_timer += GetFrameTime();
+            if (creature->damage_timer >= DAMAGE_TIME) {
+                creature->damage_timer = 0;
+                creature->state = CREATURE_ALIVE;
+            }
+            update_creature_movement(map, creature);
+            update_creature_animation(creature);
+            break;
+        }
+        case CREATURE_DEAD:
+        {
+            if (creature->animation_index < (ANIMATION_AMOUNT - 1)) {
+                creature->animation_timer += GetFrameTime();
+                if (creature->animation_timer > ANIMATION_RATE) {
+                    creature->animation_timer -= ANIMATION_RATE;
+                    creature->animation_index = (creature->animation_index + 1) % ANIMATION_AMOUNT;
+                    creature->plane.model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = creature->death_textures[creature->animation_index];
+                }
+            }
+            break;
+        }
+    }
+
+    creature->transform = (Matrix)MatrixMultiply(
+        MatrixRotateY(creature->angle),
+        MatrixTranslate(
+            creature->position.x,
+            creature->position.y,
+            creature->position.z
+        )
+    );
+
+    Vector3 player_dir = {
+        player.x - creature->position.x,
+        0.0f,
+        player.z - creature->position.z
+    };
+    creature->angle = atan2f(player_dir.x, player_dir.z) * RAD2DEG;
+}
+
+void render_creature(const Creature *creature, Vector3 player) {
     Vector3 axis = { 0.0f, 1.0f, 0.0f };
     DrawModelEx(
         creature->plane.model,
         creature->position,
         axis,
-        angle,
+        creature->angle,
         (Vector3){ 1.0f, 1.0f, 1.0f },
         WHITE
     );
@@ -281,7 +334,7 @@ void free_plane(Plane plane) {
     UnloadTexture(plane.texture);
 }
 
-void draw_map(const char map[16][16], Vector3 player_world_position, Vector3 squid_world_position) {
+void draw_map(const char map[16][16], Vector3 player_world_position, const Creature squid[SQUID_AMOUNT]) {
     float size = 10;
     for (int x = 0; x < 16; x++) {
         for (int z = 0; z < 16; z++) {
@@ -298,8 +351,10 @@ void draw_map(const char map[16][16], Vector3 player_world_position, Vector3 squ
     Cell player_position = world_position_to_cell_position(player_world_position);
     DrawCircle((player_position.x * size) + half_size, (player_position.z * size) + half_size, half_size, RED);
 
-    Cell squid_position = world_position_to_cell_position(squid_world_position);
-    DrawCircle((squid_position.x * size) + half_size, (squid_position.z * size) + half_size, half_size, GREEN);
+    for (int i = 0; i < SQUID_AMOUNT; i++) {
+        Cell squid_position = world_position_to_cell_position(squid[i].position);
+        DrawCircle((squid_position.x * size) + half_size, (squid_position.z * size) + half_size, half_size, GREEN);
+    }
 }
 
 bool is_wall_at_position(const char map[16][16], Vector3 pos) {
@@ -321,6 +376,52 @@ bool collides(const char map[16][16], float x, float z) {
         is_wall_at_position(map, (Vector3){ x - PLAYER_RADIUS, 0, z + PLAYER_RADIUS }) ||
         is_wall_at_position(map, (Vector3){ x - PLAYER_RADIUS, 0, z - PLAYER_RADIUS })
     );
+}
+
+void play_sound_random_pitch(Sound sound) {
+    float pitch = random_float(1.0f, 2.0f);
+    SetSoundPitch(sound, pitch);
+    PlaySound(sound);
+}
+
+void fire(Camera camera, Creature squid[SQUID_AMOUNT]) {
+    Vector3 forward = Vector3Normalize(
+        Vector3Subtract(camera.target, camera.position)
+    );
+
+    Ray ray = (Ray){
+        .position = Vector3Add(camera.position, Vector3Scale(forward, FIRE_START_OFFSET)),
+        .direction = forward
+    };
+
+    int closest_index = -1;
+    float closest_distance = 99999999.9;
+
+    for (int i = 0; i < SQUID_AMOUNT; i++) {
+        Creature *s = &squid[i];
+
+        if (s->state == CREATURE_DEAD) {
+            continue;
+        }
+
+        RayCollision collision = GetRayCollisionSphere(ray, s->position, s->hit_radius);
+
+        if (collision.distance < closest_distance) {
+            closest_index = i;
+            closest_distance = collision.distance;
+        }
+    }
+
+    if (closest_index >= 0) {
+        Creature *s = &squid[closest_index];
+        s->health--;
+        if (s->health <= 0) {
+            s->state = CREATURE_DEAD;
+            s->animation_index = 0;
+        } else {
+            s->state = CREATURE_DAMAGED;
+        }
+    }
 }
 
 int main(void) {
@@ -347,6 +448,8 @@ int main(void) {
 
     InitWindow(1600, 1200, "Who is this");
 
+    InitAudioDevice();
+
     Plane wall = alloc_plane(PLANE_WALL, dirt);
     Plane floor = alloc_plane(PLANE_FLOOR, dirt_dark);
     Plane ceiling = alloc_plane(PLANE_CEILING, dirt);
@@ -356,33 +459,61 @@ int main(void) {
     camera.fovy = 60.0f;
     camera.projection = CAMERA_PERSPECTIVE;
     float yaw = 0.0f;
-    float pitch = 0.0f;
 
     DisableCursor();
 
     SetTargetFPS(60);
 
-    Creature squid;
+    Sound bullet_sound = LoadSound("sounds/gun/bullet.wav");
+    float gun_animation_timer = 0;
+    int gun_texture_index = 0;
+    Texture gun_idle = LoadTexture("textures/gun/SpeedGun0.png");
+    Texture gun_fire[4];
+    gun_fire[0] = LoadTexture("textures/gun/SpeedGun1.png");
+    gun_fire[1] = LoadTexture("textures/gun/SpeedGun2.png");
+    gun_fire[2] = LoadTexture("textures/gun/SpeedGun3.png");
+    gun_fire[3] = LoadTexture("textures/gun/SpeedGun4.png");
 
-    squid.textures[0] = LoadTexture("textures/squid/squid0.png");
-    squid.textures[1] = LoadTexture("textures/squid/squid1.png");
-    squid.textures[2] = LoadTexture("textures/squid/squid2.png");
-    squid.textures[3] = LoadTexture("textures/squid/squid3.png");
-    squid.textures[4] = LoadTexture("textures/squid/squid4.png");
-    squid.death_textures[0] = LoadTexture("textures/squid/squid-death0.png");
-    squid.death_textures[1] = LoadTexture("textures/squid/squid-death1.png");
-    squid.death_textures[2] = LoadTexture("textures/squid/squid-death2.png");
-    squid.death_textures[3] = LoadTexture("textures/squid/squid-death3.png");
-    squid.death_textures[4] = LoadTexture("textures/squid/squid-death4.png");
-    {
-        // TODO add initialization creature function
-        Mesh mesh = GenMeshPlane(10, 10, 1, 1);
-        Model model = LoadModelFromMesh(mesh);
-        model.transform = MatrixRotateX(PI / 2.0f);
-        model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = squid.textures[0];
-        squid.plane.model = model;
+    Shader shader = LoadShader(
+        "alpha_cutout_vs.glsl",
+        "alpha_cutout_fs.glsl"
+    );
+
+    int shader_location_damage_flash = GetShaderLocation(shader, "damageFlash");
+
+    Creature squid[SQUID_AMOUNT] = {0};
+
+    for (int i = 0; i < SQUID_AMOUNT; i++) {
+        squid[i].health = 5;
+        squid[i].hit_radius = HALF_SIZE/2;
+        if (i == 0) {
+            squid[i].textures[0] = LoadTexture("textures/squid/squid0.png");
+            squid[i].textures[1] = LoadTexture("textures/squid/squid1.png");
+            squid[i].textures[2] = LoadTexture("textures/squid/squid2.png");
+            squid[i].textures[3] = LoadTexture("textures/squid/squid3.png");
+            squid[i].textures[4] = LoadTexture("textures/squid/squid4.png");
+            squid[i].death_textures[0] = LoadTexture("textures/squid/squid-death0.png");
+            squid[i].death_textures[1] = LoadTexture("textures/squid/squid-death1.png");
+            squid[i].death_textures[2] = LoadTexture("textures/squid/squid-death2.png");
+            squid[i].death_textures[3] = LoadTexture("textures/squid/squid-death3.png");
+            squid[i].death_textures[4] = LoadTexture("textures/squid/squid-death4.png");
+        } else {
+            for (int j = 0; j < ANIMATION_AMOUNT; j++) {
+                squid[i].textures[j] = squid[0].textures[j];
+                squid[i].death_textures[j] = squid[0].death_textures[j];
+            }
+        }
+        {
+            // TODO add initialization creature function
+            Mesh mesh = GenMeshPlane(10, 10, 1, 1);
+            Model model = LoadModelFromMesh(mesh);
+            model.transform = MatrixRotateX(PI / 2.0f);
+            model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = squid[i].textures[0];
+            model.materials[0].shader = shader;
+            squid[i].plane.model = model;
+        }
+        update_creature_direction(map, &squid[i]);
     }
-    update_creature_direction(map, &squid);
 
     for (int x = 0; x < 16; x++) {
         for (int z = 0; z < 16; z++) {
@@ -392,10 +523,12 @@ int main(void) {
                     camera.target = (Vector3){ 0.0f, camera.position.y, 0.0f };
                     break;
                 case 's':
-                    squid.cell.x = x;
-                    squid.cell.z = z;
-                    squid.position = cell_position_to_world_position(x, z);
-                    squid.target = squid.position;
+                    for (int i = 0; i < SQUID_AMOUNT; i++) {
+                        squid[i].cell.x = x;
+                        squid[i].cell.z = z;
+                        squid[i].position = cell_position_to_world_position(x, z);
+                        squid[i].target = squid[i].position;
+                    }
                     break;
             }
         }
@@ -434,7 +567,28 @@ int main(void) {
             camera.target = Vector3Add(camera.position, forward);
         }
 
-        update_creature(map, &squid);
+        for (int i = 0; i < SQUID_AMOUNT; i++) {
+            update_creature(map, &squid[i], camera.position);
+        }
+
+        bool is_firing = IsMouseButtonDown(0);
+
+        {
+            if (IsMouseButtonPressed(0)) {
+                gun_animation_timer = 0;
+                gun_texture_index = 0;
+                fire(camera, squid);
+                play_sound_random_pitch(bullet_sound);
+            } else if (is_firing) {
+                gun_animation_timer += GetFrameTime();
+                if (gun_animation_timer > 0.1f) {
+                    gun_animation_timer -= 0.1f;
+                    gun_texture_index = (gun_texture_index + 1) % 4;
+                    fire(camera, squid);
+                    play_sound_random_pitch(bullet_sound);
+                }
+            }
+        }
 
         BeginDrawing();
 
@@ -460,16 +614,65 @@ int main(void) {
             }
         }
 
-        render_creature(&squid, camera.position);
+        for (int i = 0; i < SQUID_AMOUNT; i++) {
+            BeginShaderMode(shader);
+            float value = 0;
+            switch (squid[i].state) {
+                default:
+                {
+                    value = 0.0f;
+                    break;
+                }
+                case CREATURE_DAMAGED:
+                {
+                    value = (DAMAGE_TIME - squid[i].damage_timer) / DAMAGE_TIME;
+                    break;
+                }
+            };
+            SetShaderValue(shader, shader_location_damage_flash, &value, SHADER_UNIFORM_FLOAT);
+            render_creature(&squid[i], camera.position);
+            EndShaderMode();
+        }
 
         EndMode3D();
 
-        draw_map(map, camera.position, squid.position);
+        draw_map(map, camera.position, squid);
+
+        {
+            float scale = 8.0f;
+            Vector2 position = {
+                (GetScreenWidth() * .5f) - ((gun_idle.width * scale) / 2),
+                GetScreenHeight() - (gun_idle.height * scale),
+            };
+            if (is_firing) {
+                DrawTextureEx(gun_fire[gun_texture_index], position, 0, scale, WHITE);
+            } else {
+                DrawTextureEx(gun_idle, position, 0, scale, WHITE);
+            }
+        }
+
+        {
+            int center_x = GetScreenWidth() / 2;
+            int center_y = GetScreenHeight() / 2;
+            int length = 20;
+            int thick = 3;
+
+            Vector2 right = { center_x - length, center_y };
+            Vector2 left = { center_x + length, center_y };
+
+            Vector2 up = { center_x, center_y - length };
+            Vector2 down = { center_x, center_y + length };
+
+            DrawLineEx(right, left, thick, RED);
+            DrawLineEx(up, down, thick, RED);
+        }
 
         EndDrawing();
     }
 
     CloseWindow();
+
+    CloseAudioDevice();
 
     return 0;
 }
